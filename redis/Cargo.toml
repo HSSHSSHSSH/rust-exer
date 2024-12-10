@@ -1,0 +1,16 @@
+[package]
+name = "redis"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+mini-redis = "0.4"
+
+[[example]]
+name = "my-redis"
+path = "examples/my-redis.rs"
+
+[[example]]
+name = "draft"
+path = "examples/draft.rs"

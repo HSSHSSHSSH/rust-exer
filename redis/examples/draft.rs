@@ -1,57 +1,61 @@
-use std::cell::RefCell;
-use std::rc::{Rc, Weak};
+use std::sync::{Arc, Mutex, Condvar};
+use std::thread;
+use std::collections::VecDeque;
 
-#[derive(Debug)]
-struct Node {
-    value: i32,
-    parent: RefCell<Weak<Node>>,
-    children: RefCell<Vec<Rc<Node>>>,
+struct SharedQueue<T> {
+    queue: Mutex<VecDeque<T>>,
+    not_empty: Condvar,
 }
 
-
-fn main() {
-    let leaf = Rc::new(Node {
-        value: 3,
-        parent: RefCell::new(Weak::new()),
-        children: RefCell::new(vec![]),
-    });
-    // 初始化完成后 Rc::strong_count(&leaf) = 1 Rc::weak_count(&leaf) = 0
-
-
-    println!(
-        "leaf strong = {}, weak = {}",
-        Rc::strong_count(&leaf), // 1
-        Rc::weak_count(&leaf), // 0
-    );
-
-    {
-        let branch = Rc::new(Node {
-            value: 5,
-            parent: RefCell::new(Weak::new()),
-            children: RefCell::new(vec![Rc::clone(&leaf)]),
-        });
-        // 初始化完成后 Rc::strong_count(&branch) = 1 Rc::weak_count(&branch) = 0 RC::strong_Count += 1
-
-        *leaf.parent.borrow_mut() = Rc::downgrade(&branch);
-        // 将 leaf 的 parent 指向 branch , Rc::weak_count(&branch) += 1
-
-        println!(
-            "branch strong = {}, weak = {}",
-            Rc::strong_count(&branch), // 1
-            Rc::weak_count(&branch), // 1
-        );
-        println!(
-            "leaf strong = {}, weak = {}",
-            Rc::strong_count(&leaf), // 2
-            Rc::weak_count(&leaf), // 0
-        );
-        // branch droped 
+impl<T> SharedQueue<T> {
+    fn new() -> Self {
+        SharedQueue {
+            queue: Mutex::new(VecDeque::new()),
+            not_empty: Condvar::new(),
+        }
     }
 
-    println!("leaf parent = {:?}", leaf.parent.borrow().upgrade()); // None
-    println!(
-        "leaf strong = {}, weak = {}",
-        Rc::strong_count(&leaf), // 1
-        Rc::weak_count(&leaf), // 0
-    );
+    fn push(&self, item: T) {
+        let mut queue = self.queue.lock().unwrap();
+        queue.push_back(item);
+        self.not_empty.notify_one();
+    }
+
+    fn pop(&self) -> T {
+        let mut queue = self.queue.lock().unwrap();
+        while queue.is_empty() {
+            queue = self.not_empty.wait(queue).unwrap();
+        }
+        queue.pop_front().unwrap()
+    }
 }
+
+fn producer_consumer_example() {
+    let queue = Arc::new(SharedQueue::new());
+    let queue2 = queue.clone();
+
+    // 消费者
+    let consumer = thread::spawn(move || {
+        for _ in 0..5 {
+            let item = queue2.pop();
+            println!("消费者: 获取到数据 {}", item);
+            thread::sleep(std::time::Duration::from_millis(500));
+        }
+    });
+
+    // 生产者
+    let producer = thread::spawn(move || {
+        for i in 0..5 {
+            println!("生产者: 放入数据 {}", i);
+            queue.push(i);
+            thread::sleep(std::time::Duration::from_millis(1000));
+        }
+    });
+
+    producer.join().unwrap();
+    consumer.join().unwrap();
+}
+
+fn main() {
+    producer_consumer_example();
+}   

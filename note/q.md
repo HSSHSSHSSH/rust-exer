@@ -157,6 +157,265 @@ match 表达式 {
 }
 ```
 
+## Cursor
+
+
+
+
+`cursor.read(&mut byte)` 是将 cursor 中的内容读取到 byte 缓冲区中。让我用例子详细说明这个过程：
+
+```rust
+use std::io::{Cursor, Read};
+
+fn main() -> std::io::Result<()> {
+    // 创建一个 cursor，内容是 [1, 2, 3, 4, 5]
+    let mut cursor = Cursor::new(vec![1, 2, 3, 4, 5]);
+    
+    // 创建一个缓冲区 byte
+    let mut byte = [0; 2];  // 长度为2的数组，初始值都是0
+    
+    // 1. 第一次读取
+    println!("读取前 byte: {:?}", byte);        // [0, 0]
+    let n1 = cursor.read(&mut byte)?;
+    println!("读取后 byte: {:?}", byte);        // [1, 2]
+    println!("读取的字节数: {}", n1);           // 2
+    println!("cursor位置: {}", cursor.position()); // 2
+    
+    // 2. 第二次读取
+    let n2 = cursor.read(&mut byte)?;
+    println!("第二次读取 byte: {:?}", byte);     // [3, 4]
+    println!("读取的字节数: {}", n2);           // 2
+    println!("cursor位置: {}", cursor.position()); // 4
+    
+    // 3. 第三次读取（只剩一个字节了）
+    let n3 = cursor.read(&mut byte)?;
+    println!("第三次读取 byte: {:?}", byte);     // [5, 4] 注意第二个位置没变
+    println!("读取的字节数: {}", n3);           // 1
+    println!("cursor位置: {}", cursor.position()); // 5
+    
+    Ok(())
+}
+```
+
+
+让我们看一些不同大小的缓冲区示例：
+
+```rust
+use std::io::{Cursor, Read};
+
+fn main() -> std::io::Result<()> {
+    let mut cursor = Cursor::new(vec![1, 2, 3, 4, 5]);
+    
+    // 1. 单字节读取
+    let mut one_byte = [0; 1];
+    cursor.read(&mut one_byte)?;
+    println!("读取一个字节: {:?}", one_byte);  // [1]
+    
+    // 2. 两字节读取
+    let mut two_bytes = [0; 2];
+    cursor.read(&mut two_bytes)?;
+    println!("读取两个字节: {:?}", two_bytes); // [2, 3]
+    
+    // 3. 大缓冲区读取（大于剩余数据）
+    let mut big_buf = [0; 10];
+    let n = cursor.read(&mut big_buf)?;
+    println!("读取到大缓冲区: {:?}", &big_buf[..n]); // [4, 5]
+    println!("实际读取字节数: {}", n);  // 2
+    
+    Ok(())
+}
+```
+
+
+一些重要的特点：
+
+1. **读取大小受限于缓冲区**：
+```rust
+let mut cursor = Cursor::new(vec![1, 2, 3, 4, 5]);
+let mut small_buf = [0; 1];
+
+cursor.read(&mut small_buf)?;
+println!("只读取了一个字节: {:?}", small_buf); // [1]
+```
+
+
+2. **读取位置会前进**：
+```rust
+let mut cursor = Cursor::new(vec![1, 2, 3]);
+let mut buf = [0; 1];
+
+cursor.read(&mut buf)?;
+println!("位置1: {}", cursor.position()); // 1
+
+cursor.read(&mut buf)?;
+println!("位置2: {}", cursor.position()); // 2
+```
+
+
+3. **可以重置位置重新读取**：
+```rust
+let mut cursor = Cursor::new(vec![1, 2, 3]);
+let mut buf = [0; 2];
+
+cursor.read(&mut buf)?;
+println!("第一次读取: {:?}", buf); // [1, 2]
+
+cursor.seek(SeekFrom::Start(0))?;
+cursor.read(&mut buf)?;
+println!("重新读取: {:?}", buf);  // [1, 2]
+```
+
+
+4. **读取到末尾的情况**：
+```rust
+let mut cursor = Cursor::new(vec![1, 2]);
+let mut buf = [0; 3];
+
+let n = cursor.read(&mut buf)?;
+println!("读取的字节数: {}", n);     // 2
+println!("缓冲区内容: {:?}", buf);   // [1, 2, 0]
+```
+
+这个机制使得我们可以：
+- 灵活控制每次读取的数据量
+- 在需要时重复读取数据
+- 精确知道读取了多少数据
+- 处理大小不匹配的情况
+
+
+## b
+
+
+
+
+
+
+`b` 前缀表示这是一个字节字面量（byte literal），它创建一个 `u8` 类型的值。在 Rust 中，`b` 前缀用于表示 ASCII 字符的字节值。
+
+例如：
+```rust
+// 字节字面量
+let byte1: u8 = b'+';  // ASCII 值为 43
+let byte2: u8 = b'-';  // ASCII 值为 45
+let byte3: u8 = b'*';  // ASCII 值为 42
+
+// 比较
+println!("{}", b'+' == 43);  // true
+println!("{}", b'-' == 45);  // true
+
+// 字节字符串字面量
+let bytes = b"Hello";  // &[u8; 5]
+```
+
+
+在 Redis 协议解析中的应用：
+```rust
+impl Frame {
+    pub fn parse(buf: &mut Cursor<&[u8]>) -> Result<Frame> {
+        // buf.get_u8() 返回一个 u8，所以需要与字节字面量比较
+        match buf.get_u8() {
+            b'+' => {  // 43u8，表示简单字符串
+                let string = get_line(buf)?;
+                Ok(Frame::Simple(string))
+            }
+            b'-' => {  // 45u8，表示错误
+                let string = get_line(buf)?;
+                Ok(Frame::Error(string))
+            }
+            b':' => {  // 58u8，表示整数
+                let num = get_decimal(buf)?;
+                Ok(Frame::Integer(num))
+            }
+            b'$' => {  // 36u8，表示批量字符串
+                // ...
+            }
+            b'*' => {  // 42u8，表示数组
+                // ...
+            }
+            actual => {
+                Err(format!("invalid byte: {}", actual).into())
+            }
+        }
+    }
+}
+```
+
+
+字节字面量与字符字面量的区别：
+```rust
+let byte = b'A';    // u8 类型，值为 65
+let char = 'A';     // char 类型，4字节 Unicode 字符
+
+// 字节字符串与普通字符串
+let bytes = b"Hello";  // &[u8; 5]，ASCII 字节数组
+let string = "Hello";  // &str，UTF-8 字符串
+
+// 只能用于 ASCII 字符
+// let invalid = b'世';  // 错误：非 ASCII 字符不能用作字节字面量
+```
+
+
+常见用途：
+1. **协议解析**：
+```rust
+fn parse_protocol(byte: u8) {
+    match byte {
+        b'\r' => println!("回车符"),
+        b'\n' => println!("换行符"),
+        b' ' => println!("空格"),
+        _ => println!("其他字符"),
+    }
+}
+```
+
+
+2. **二进制数据处理**：
+```rust
+let header = [b'P', b'N', b'G'];  // 文件魔数
+let data = vec![0u8; 100];
+
+if data.starts_with(&header) {
+    println!("这是 PNG 文件");
+}
+```
+
+
+3. **ASCII 字符集操作**：
+```rust
+fn is_digit(byte: u8) -> bool {
+    byte >= b'0' && byte <= b'9'
+}
+
+fn is_uppercase(byte: u8) -> bool {
+    byte >= b'A' && byte <= b'Z'
+}
+```
+
+
+4. **网络协议**：
+```rust
+const HTTP_GET: &[u8] = b"GET";
+const HTTP_POST: &[u8] = b"POST";
+
+fn parse_http_method(data: &[u8]) {
+    match data {
+        HTTP_GET => println!("GET 请求"),
+        HTTP_POST => println!("POST 请求"),
+        _ => println!("其他请求"),
+    }
+}
+```
+
+
+总结：
+- `b` 前缀创建字节字面量（`u8` 类型）
+- 只能用于 ASCII 字符
+- 常用于二进制协议解析
+- 与字符字面量（`char`）不同
+- 在处理二进制数据时很有用
+
+
+
 ## tokio
 
 ### tokio 中的 async 与 await

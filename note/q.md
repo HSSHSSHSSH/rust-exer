@@ -463,6 +463,160 @@ async fn main() {
 
 - 在 Rust 中，async 函数在定义时不会立即执行，只有在调用 .await 时才会真正开始执行。
 
+
+#### .await 与 poll
+
+让我来解释 `.await` 和 `poll` 的关系：
+
+1. **`.await` 机制**
+- 当你使用 `.await` 时，Rust 编译器会将代码转换为状态机
+- 这个状态机会通过 `Future` trait 的 `poll` 方法来驱动异步操作
+
+2. **编译器展开**
+当你写这样的代码：
+```rust
+async fn main() {
+    let future = Delay { when };
+    let out = future.await;
+}
+```
+
+编译器实际上会将其转换为类似这样的状态机：
+```rust
+// 这是简化的伪代码，展示原理
+enum MainFuture {
+    State0(Delay),
+    State1,
+    Completed,
+}
+
+impl Future for MainFuture {
+    type Output = ();
+    
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        loop {
+            match self {
+                State0(delay) => {
+                    // 调用内部 Future 的 poll
+                    match delay.poll(cx) {
+                        Poll::Ready(output) => {
+                            // 转移到下一个状态...
+                            self.set(State1);
+                            continue;
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+                // 其他状态处理...
+            }
+        }
+    }
+}
+```
+
+3. **关键点**
+- `Future` trait 确实定义了 `poll` 方法作为必须实现的方法
+- `.await` 是编译器层面的语法糖，它会自动生成调用 `poll` 的代码
+- 这个机制允许异步运行时（如 tokio）来控制 Future 的执行
+
+4. **执行流程**
+1. 当遇到 `.await` 时，当前的 Future 会被注册到异步运行时
+2. 运行时会调用 Future 的 `poll` 方法
+3. 如果返回 `Poll::Pending`，运行时会保存这个 Future 并等待被唤醒
+4. 当 `waker` 被触发时，运行时会再次调用 `poll`
+5. 直到获得 `Poll::Ready` 结果
+
+所以，`.await` 和 `poll` 的关系是：`.await` 是高层语法，它通过编译器生成的代码来调用底层的 `poll` 方法。这不是 `Future` trait 的默认行为，而是 Rust 异步编程的核心设计。
+
+
+#### waker 的粗暴理解
+
+
+当在 poll 中调用 cs.waker().wake_ny_ref() 时，运行时就会在 loop 中一直使用 match 来匹配 self 的状态了
+
+```rust
+// 这是简化的运行时实现伪代码
+struct Runtime {
+    // 待处理的 Future 队列
+    pending_futures: Vec<(Future, Waker)>,
+    // 已经被唤醒需要重新检查的 Future 队列
+    woken_futures: Vec<Future>,
+}
+
+impl Runtime {
+    fn run(&mut self) {
+        loop {
+            // 1. 检查所有被唤醒的 futures
+            for future in self.woken_futures.drain(..) {
+                match future.poll() {
+                    Poll::Ready(result) => {
+                        // Future 完成，处理结果
+                    },
+                    Poll::Pending => {
+                        // 当 future 调用 wake_by_ref() 时
+                        // future 会被重新加入 pending_futures
+                        self.pending_futures.push((future, waker));
+                    }
+                }
+            }
+
+            // 2. 如果没有被唤醒的 futures，则等待
+            if self.woken_futures.is_empty() {
+                // 等待直到某个 waker 被触发
+                self.wait_for_wakeup();
+            }
+        }
+    }
+}
+
+// 当 waker.wake() 被调用时
+impl Waker {
+    fn wake(&self) {
+        // 将对应的 future 从 pending_futures 移动到 woken_futures
+        let future = /* 从 pending_futures 找到对应的 future */;
+        runtime.woken_futures.push(future);
+    }
+}
+```
+
+这个模型中：
+
+1. **Future 状态管理**
+- 未完成的 Future 存在 `pending_futures` 中
+- 被唤醒的 Future 会被移到 `woken_futures` 中
+- 运行时主循环会不断检查 `woken_futures`
+
+2. **wake_by_ref() 的作用**
+```rust
+impl Future for Delay {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<&'static str> {
+        if Instant::now() >= self.when {
+            Poll::Ready("done")
+        } else {
+            cx.waker().wake_by_ref();  // 将自己注册到 pending_futures
+            Poll::Pending              // 返回 Pending，等待下次被唤醒
+        }
+    }
+}
+```
+
+3. **执行流程**
+1. Future 返回 `Pending` 时，会被放入 `pending_futures`
+2. 当条件满足时（如 I/O 完成、时间到达），调用 `wake()`
+3. `wake()` 将 Future 移动到 `woken_futures`
+4. 运行时主循环检测到 `woken_futures` 有内容，继续处理
+
+所以你的理解基本正确，只是有两点补充：
+- 实际上是两个队列在配合工作（pending 和 woken）
+- 运行时不会一直轮询所有 Future，而是只处理被唤醒的 Future，这样更高效
+
+这种机制保证了：
+- 高效的资源使用（不会忙等）
+- 及时的任务处理（被唤醒后立即处理）
+- 良好的并发性能（可以处理大量 Future）
+
+
+
 ### spanw
 
 - 任务是轻量级的

@@ -636,3 +636,497 @@ impl Future for Delay {
     - 设计用于跨越 .await 点持有锁
     - 内部仍然使用同步互斥锁
     - 增加了额外的异步开销
+
+
+### waker 需要满足的要求
+
+
+waker 需要满足的核心要求是：当一个 Future 返回 `Poll::Pending` 时，必须确保在未来某个时刻当该 Future 可以取得进展时，会调用 waker 来通知执行器。
+
+让我们通过代码来理解：
+
+```rust
+impl Future for MySelect {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // 将 cx (包含 waker) 传递给内部 futures
+        if let Poll::Ready(val) = Pin::new(&mut self.rx1).poll(cx) {
+            return Poll::Ready(());
+        }
+
+        if let Poll::Ready(val) = Pin::new(&mut self.rx2).poll(cx) {
+            return Poll::Ready(());
+        }
+
+        // 只有当内部 futures 都返回 Pending 时才返回 Pending
+        // 此时内部 futures 已经保存了 waker，并会在就绪时调用
+        Poll::Pending
+    }
+}
+```
+
+waker 要求具体包括：
+
+1. **保存 waker**：
+   - Future 在返回 `Pending` 时必须保存当前的 waker
+   - 确保可以在将来使用它来通知执行器
+
+2. **及时通知**：
+   - 当 Future 可以继续执行时，必须调用 waker
+   - 不能遗漏通知，否则任务可能永远挂起
+
+3. **正确传播**：
+   - 复合 Future (如 MySelect) 必须正确传递 waker 给内部 futures
+   - 确保通知可以正确传播到执行器
+
+如果不满足这些要求，可能导致任务永远挂起，因为执行器不知道何时需要重新轮询该 Future。
+
+### select
+q: 会不会出现以下情况：
+rx2状态改为 ready 时 poll 方法并未执行，rx1 状态改为 ready 时，poll 方法执行
+
+a: 这种情况是可能发生的。让我们看看相关代码：
+
+
+```11:27:redis/examples/select.rs
+impl Future for MySelect {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if let Poll::Ready(val) = Pin::new(&mut self.rx1).poll(cx) {
+            println!("rx1 completed first with {:?}", val);
+            return Poll::Ready(());
+        }
+
+        if let Poll::Ready(val) = Pin::new(&mut self.rx2).poll(cx) {
+            println!("rx2 completed first with {:?}", val);
+            return Poll::Ready(());
+        }
+
+        Poll::Pending
+    }
+}
+```
+
+
+在这个实现中，`poll` 方法是按顺序检查 rx1 和 rx2 的。如果在某个时刻：
+
+1. rx2 变为 Ready
+2. 但在运行时调用 `poll` 之前，rx1 也变为 Ready
+3. 当 `poll` 执行时，会先检查 rx1，发现它 Ready
+4. rx1 的分支会被执行，而 rx2 的 Ready 状态会被忽略
+
+这就是为什么实际的 `select!` 宏的实现会随机选择轮询顺序，以避免总是偏向第一个分支。让我们看看文档中提到的这一点：
+
+
+```517:521:note/q.md
+3. **关键点**
+- `Future` trait 确实定义了 `poll` 方法作为必须实现的方法
+- `.await` 是编译器层面的语法糖，它会自动生成调用 `poll` 的代码
+- 这个机制允许异步运行时（如 tokio）来控制 Future 的执行
+
+```
+
+
+为了解决这个问题，tokio 的 `select!` 宏实际实现会：
+
+1. 随机化轮询顺序
+2. 确保公平性
+3. 避免饥饿问题
+
+这样就能确保所有分支都有公平的机会被执行，而不是总是偏向于代码中排在前面的分支。
+
+#### 异步表达式阶段与处理器阶段
+不矛盾，这里说的是两个不同的阶段：
+
+1. **异步表达式阶段**（并发执行）：
+
+When the select macro is evaluated, all the <async expression>s are aggregated and executed concurrently.
+```rust
+tokio::select! {
+    // 这些异步表达式会并发执行
+    res1 = async { ... } => handler1(),
+    res2 = async { ... } => handler2(),
+}
+```
+
+2. **处理器阶段**（互斥执行）：
+When it comes to each branch's <handler>, select! guarantees that only a single <handler> runs
+```rust
+tokio::select! {
+    _ = async_op1() => {
+        // 只有一个处理器会执行
+        // 如果这个处理器执行，另一个就不会执行
+        mut_data.modify();  // 可以安全地可变借用
+    }
+    _ = async_op2() => {
+        // 这个处理器和上面的处理器不会同时执行
+        mut_data.modify();  // 也可以安全地可变借用
+    }
+}
+```
+
+执行流程：
+1. 所有 `async { ... }` 表达式并发执行
+2. 当其中一个完成时，其对应的处理器被执行
+3. 其他异步表达式被取消，它们的处理器不会执行
+
+#### 随机选择 与 消息保留
+- 随机选择
+
+以上中也提到了当在一次 select 中，如果多个异步表达式同时完成，那么会随机选择一个执行；以下再说以下
+
+```rust
+async fn example() {
+    let (tx1, mut rx1) = mpsc::channel(1);
+    let (tx2, mut rx2) = mpsc::channel(1);
+    
+    // 假设两个通道都有消息
+    tx1.send(1).await.unwrap();
+    tx2.send(2).await.unwrap();
+    
+    // select! 会随机选择一个通道
+    tokio::select! {
+        msg = rx1.recv() => println!("rx1: {:?}", msg),
+        msg = rx2.recv() => println!("rx2: {:?}", msg),
+    }
+    // 另一个消息仍然在通道中
+}
+```
+select! 宏随机选择首先检查就绪状态的分支。当多个通道有待处理的值时，会随机选择一个通道来接收。这是为了处理接收循环处理消息的速度比它们被推入通道的速度慢的情况，意味着通道开始填满。如果 select! 不随机选择首先检查的分支，在循环的每次迭代中，都会先检查 rx1。如果 rx1 总是包含新消息，其余通道就永远不会被检查。
+如果当 select! 被求值时，多个通道有待处理的消息，只有一个通道的值会被弹出。所有其他通道保持不变，它们的消息保留在这些通道中，直到下一次循环迭代。不会丢失任何消息。
+
+- 消息保留
+```rust
+async fn action() -> i32 {
+    // Some asynchronous logic
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    println!("action");
+    return 1;
+}
+
+#[tokio::main]
+async fn main() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(128);    
+    
+    tx.send(1).await.unwrap();
+    tx.send(2).await.unwrap();
+
+    // 在 loop 之外创建 future ，在 loop 内部使用，确保是同一个 future
+    let operation = action();
+    // 异步任务发生移动时，内部自引用会失效，所以要 Pin, Pin 是 .await 的必要条件
+    tokio::pin!(operation);
+    
+    loop {
+        tokio::select! {
+            // 不用显示调用 await ，select 内部会尝试推进异步任务
+            /*
+            * 需要 &mut 原因如下：
+            * 1. Future 在执行过程中需要修改其内部状态
+            * 2. 不可变引用（&）不允许修改状态
+            * 3. poll 方法需要 Pin<&mut Self> 来推进 Future 的执行
+            */
+            _ = &mut operation => break,
+            Some(v) = rx.recv() => {
+                if v % 2 == 0 {
+                    break;
+                }
+            }
+        }
+    }
+}
+```
+
+#### future 的消耗性
+
+通常的 future 是消耗性的，即一旦被使用，就不能再被使用。
+
+
+
+
+
+
+
+
+
+
+让我详细解释为什么会 panic：
+
+1. **普通的 await 行为**：
+```rust
+async fn example() {
+    let future = async { 42 };
+    let result = future.await;    // future 被消耗
+    // let result2 = future.await;  // ❌ 错误：future 已被消耗
+}
+```
+
+
+2. **通过引用 await 的行为**：
+```rust
+async fn example() {
+    let future = async { 42 };
+    let mut pinned = Box::pin(future);
+    
+    let result = (&mut pinned).await;  // future 没有被消耗
+    let result2 = (&mut pinned).await; // ❌ panic: 尝试重用已完成的 future
+}
+```
+
+
+3. **在 select! 中的情况**：
+```rust
+let operation = action(None);
+tokio::pin!(operation);
+
+loop {
+    tokio::select! {
+        res = &mut operation => {  // 通过引用使用 operation
+            // operation 完成了，但还存在
+        }
+        // 下次循环会再次尝试 poll 已完成的 operation
+        // 这会导致 panic
+    }
+}
+```
+
+
+原因是：
+- Future 设计为一次性使用
+- 通过引用 await 不会消耗 Future
+- 重复 poll 已完成的 Future 是不安全的
+- 这就像尝试从已关闭的文件读取数据
+
+所以需要使用 `done` 标志：
+```rust
+let mut done = false;
+loop {
+    tokio::select! {
+        res = &mut operation, if !done => {  // 只有未完成时才尝试 poll
+            done = true;
+        }
+    }
+}
+```
+
+q: 为什么下一次循环不会异常？
+
+```rust
+loop {
+        tokio::select! {
+            res = &mut operation, if !done => {
+                done = true;
+
+                if let Some(v) = res {
+                    println!("GOT = {}", v);
+                    return;
+                }
+            }
+            Some(v) = rx.recv() => {
+                if v % 2 == 0 {
+                    // `.set` is a method on `Pin`.
+                    operation.set(action(Some(v)));
+                    done = false;
+                }
+            }
+        }
+    }
+```
+
+
+
+
+让我解释为什么下一次循环不会异常：
+
+1. **关键在于 `operation.set()`**：
+```rust
+loop {
+    tokio::select! {
+        res = &mut operation, if !done => {
+            done = true;  // 标记完成
+        }
+        Some(v) = rx.recv() => {
+            if v % 2 == 0 {
+                // 重要！创建新的 Future 并替换旧的
+                operation.set(action(Some(v)));  
+                done = false;  // 重置完成标志
+            }
+        }
+    }
+}
+```
+
+
+2. **Pin::set 的作用**：
+```rust
+impl<P> Pin<P> {
+    pub fn set(&mut self, value: T) {
+        // 替换被固定的值，但保持 Pin 不变
+        // 相当于创建了一个全新的 Future
+    }
+}
+```
+
+
+执行流程：
+1. 第一次循环：
+```rust
+// operation 完成
+res = &mut operation, if !done => {
+    done = true;  // 标记完成
+}
+```
+
+
+2. 收到新值时：
+```rust
+Some(v) = rx.recv() => {
+    if v % 2 == 0 {
+        operation.set(action(Some(v)));  // 创建新的 Future
+        done = false;  // 重置标志
+    }
+}
+```
+
+
+3. 下一次循环：
+```rust
+// operation 是全新的 Future，可以安全使用
+res = &mut operation, if !done => {
+    // ...
+}
+```
+
+
+所以不会异常，因为：
+- 不是重用已完成的 Future
+- 而是用新的 Future 替换了旧的
+- `done` 标志也被重置
+
+
+
+#### select 与 spawn 的并发对比
+
+
+**每个任务的并发性**
+
+`tokio::spawn` 和 `select!` 都能运行并发的异步操作。但是，它们用于运行并发操作的策略不同：
+
+1. **tokio::spawn 的特点**：
+```rust
+// 创建新任务
+tokio::spawn(async {
+    // 这是一个独立的任务
+    // 可能在不同的 OS 线程上运行
+    // 不能借用外部数据
+});
+```
+
+
+
+2. **select! 的特点**：
+```rust
+tokio::select! {
+    // 所有分支在同一个任务中运行
+    _ = async_op1() => {},
+    _ = async_op2() => {},
+    // 永远不会同时运行
+}
+```
+
+
+
+3. **对比示例**：
+```rust
+async fn example() {
+    let data = vec![1, 2, 3];
+    
+    // spawn 方式 - 需要所有权
+    tokio::spawn(async move {
+        process_data(data).await  // data 被移动到新任务
+    });
+    
+    // select 方式 - 可以借用
+    tokio::select! {
+        _ = process_data(&data) => {},  // 可以借用 data
+        _ = backup_data(&data) => {},   // 可以同时借用
+    }
+}
+```
+
+
+
+4. **任务调度的区别**：
+```rust
+// spawn 创建多个独立任务
+tokio::spawn(async { task1().await });
+tokio::spawn(async { task2().await });
+// 可能同时在不同线程运行
+
+// select 在单个任务中多路复用
+tokio::select! {
+    _ = task1() => {},
+    _ = task2() => {},
+}
+// 永远在同一个任务中交替执行
+```
+
+
+
+关键区别：
+
+1. **执行模型**：
+   - spawn: 创建新任务，可能并行执行
+   - select: 在同一任务中交替执行
+
+2. **数据访问**：
+   - spawn: 需要所有权，不能借用
+   - select: 可以借用数据
+
+3. **资源使用**：
+   - spawn: 每个任务都有独立的资源
+   - select: 共享同一个任务的资源
+
+4. **使用场景**：
+   - spawn: 适合独立的长期运行任务
+   - select: 适合需要协调的多个操作
+
+示例应用：
+
+1. **使用 spawn**：
+```rust
+// 独立的后台任务
+tokio::spawn(async {
+    loop {
+        cleanup_database().await;
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+    }
+});
+```
+
+
+
+2. **使用 select**：
+```rust
+// 需要协调的操作
+tokio::select! {
+    res = process_request(&data) => {
+        handle_response(res);
+    }
+    _ = timeout(Duration::from_secs(5)) => {
+        handle_timeout();
+    }
+}
+```
+
+
+
+选择建议：
+1. 使用 spawn 当：
+   - 需要真正的并行执行
+   - 任务相互独立
+   - 不需要共享数据
+
+2. 使用 select 当：
+   - 需要协调多个操作
+   - 需要共享数据
+   - 需要取消或超时处理

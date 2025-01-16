@@ -24,15 +24,26 @@ impl BlockingClient {
 
         Ok(BlockingClient { inner, rt })
     }
-}
 
+    pub fn get(&mut self, key: &str) -> crate::Result<Option<Bytes>> {
+        self.rt.block_on(self.inner.get(key))
+    }
 
-async fn deadlock_example() {
-    // 这里运行在运行时A的上下文中
-    let rt = Runtime::new().unwrap();
-    
-    // block_on 会阻塞运行时A正在使用的线程
-    rt.block_on(std::thread::spawn(async {
-        println!("...");
-    }));
+    pub fn set(&mut self, key: &str, value: Bytes) -> crate::Result<()> {
+        self.rt.block_on(self.inner.set(key, value))
+    }
+
+    pub fn set_expires(
+        &mut self,
+        key: &str,
+        value: Bytes,
+        expiration: Duration,
+    ) -> crate::Result<()> {
+        self.rt
+            .block_on(self.inner.set_expires(key, value, expiration))
+    }
+
+    pub fn publish(&mut self, channel: &str, message: Bytes) -> crate::Result<u64> {
+        self.rt.block_on(self.inner.publish(channel, message))
+    }
 }

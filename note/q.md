@@ -1131,7 +1131,21 @@ tokio::select! {
    - 需要共享数据
    - 需要取消或超时处理
 
-### block_on 的使用问题
+
+ 
+### 局部异步代码
+
+#### block_on 创建运行时
+
+```rust
+let rt = Runtime::new().unwrap();
+rt.block_on(async {
+    // 这里运行在运行时A的上下文中
+});
+```
+#### block_on 的使用问题
+
+block_on 会阻塞当前线程，直到异步任务完成。
 
 在以下情况下使用 block_on 会导致问题：
 在任何已有 Tokio 运行时上下文中使用，包括：
@@ -1142,4 +1156,29 @@ tokio::select! {
 本质原因：
 - Tokio 不允许在一个运行时上下文中创建并使用新的运行时
 
- 
+#### Runtime spawn
+
+在运行时上创建新的后台任务
+```rust
+use tokio::runtime::Builder;
+let runtime = Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+runtime.spawn(async {
+    // 这里运行在运行时A的上下文中
+});
+```
+#### 在独立的线程中运行 Runtime, 通过消息传递进行通信
+
+适用于需要保持主线程响应性的场景
+
+### 优雅关闭
+
+There are usually three parts to implementing graceful shutdown:
+
+1. Figuring out when to shut down.
+2. Telling every part of the program to shut down.
+3. Waiting for other parts of the program to shut down.
